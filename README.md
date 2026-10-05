@@ -4,6 +4,8 @@
 
 基于 [DeepAgents](https://github.com/langchain-ai/deepagents)（LangGraph 之上的 Agent harness）构建：本地 RAG 负责"取证"，LLM 负责"教学"，五条教学法 Skill 负责"怎么教"，CLI 与 Web（FastAPI + React）双入口共享同一套 Agent 装配与会话记忆。
 
+本项目也是 Datawhale《Deep Agents 实战》课程（ch02–ch09）的**综合实战作品**：课程中每个核心机制——工具调用循环、虚拟文件系统 jail、Middleware、Skills 渐进披露、Checkpointer 短期记忆 / Store 长期记忆——都在本项目中有意识地落地或取舍，详见下文 [DeepAgents 课程知识在本项目的落地](#deepagents-课程知识在本项目的落地)。
+
 ![Web 端概念答疑：侧栏历史会话 + 带页码引用的流式回答](docs/images/web-answer-citations.png)
 
 ---
@@ -147,6 +149,85 @@ flowchart LR
 
 系统提示词（`prompts.py`）中只写入技能路由规则与名称，`SKILL.md` 全文由模型在需要时自行 `read_file` 拉取——这是 DeepAgents SkillsMiddleware 的**渐进披露（progressive disclosure）**模式：控制每轮上下文体积，同时让技能内容可以独立迭代、随仓库分发。
 
+## DeepAgents 课程知识在本项目的落地
+
+> 对应 Datawhale《Deep Agents 实战》ch02–ch09。下面不是课程摘抄，而是每个机制在本项目代码中的**具体落点与取舍理由**。
+
+### 1. 三层心智模型：Runtime → Framework → Harness
+
+| 层 | 角色 | 本项目对应 |
+|---|---|---|
+| **Runtime：LangGraph** | 状态图运行时——状态通道、超步（superstep）循环、checkpointer、中断恢复、流式事件 | 编译产物是一个 `CompiledStateGraph`（继承链 Pregel → Runnable），`model ⇄ tools` 成环、条件边决定回到模型还是 END |
+| **Framework：LangChain** | 模型/工具的标准化接口（ChatModel、Tool、消息类型、Runnable 协议） | `ChatOpenAI` 走 OpenAI 兼容协议接 DeepSeek；`@tool` 把函数签名翻译成 JSON Schema |
+| **Harness：Deep Agents** | 在 Runtime/Framework 之上预装"Agent 工作套件"：文件系统、子代理、Skills、摘要、规划——全部以 Middleware 形式挂载 | `create_deep_agent()` 一行装配；harness profile 裁剪工具面 |
+
+关键认知：**模型是冻结的文本函数，工具是它连接真实世界的唯一通道**。"工具调用"是四方协作——`create_deep_agent` 注册 schema → 模型只输出 `tool_calls`（点菜）→ LangGraph 在本机执行 Python 函数（上菜）→ 结果包成 ToolMessage 回灌 → 模型再推理。模型永远看不到函数体，所以工具的 **docstring 不是注释而是模型的说明书**：本项目 4 个工具的 docstring 都按"做什么 / 何时调用 / 参数含义 / 空结果怎么办"写满（见 `tools.py`），这是模型能否正确取证的决定性因素。
+
+### 2. 课程能力地图（ch02–ch09 → 本项目）
+
+| 课程章节 | 核心机制 | 在本项目的落地 / 取舍 |
+|---|---|---|
+| ch02 第一个 Agent | `create_deep_agent(model, tools, system_prompt)`；`invoke` 的 model⇄tools 循环；OpenAI 兼容 `base_url` 切平台 | [agent.py](src/teach_agent/agent.py) `_assemble()`；换模型只改 `.env` 三项；CLI 用同步图，Web 用异步图 + `astream_events(version="v2")` 驱动 SSE |
+| ch03 虚拟文件系统 | 虚拟文件 = state 中的 `files` 字典；Backend 决定物理存哪；`FilesystemBackend(virtual_mode=True)` 路径沙箱；大结果自动卸载（>2 万 token）/ 历史自动摘要（窗口 85%） | jail 落 `data/agent_fs/` 且开启 `virtual_mode`；剔除写/执行工具只留只读 `read_file`；工具输出 4000 字符截断 + `read_chunk` 按需复读，与 harness 自带的卸载/摘要共同做 Context Engineering |
+| ch04 任务规划与 Middleware | 六 Hook 洋葱圈（`before/after_agent/model` + `wrap_model_call/tool_call`）；v0.7 起 `TodoListMiddleware` 需显式启用 | **刻意不启用 todo 规划**：教材答疑是"检索→取证→讲清"的短环任务，按课程决策表"单步问答、短工具调用保持关闭，避免计划比任务还长"；教学流程由系统提示词工作流 + Skill 剧本承担 |
+| ch05 子 Agent 与上下文隔离 | 主 Agent 经 `task` 工具委派，子 Agent 在独立上下文运行、只回传摘要 | **经 harness profile 关闭通用子代理**（见下节）：答疑必须维持单一教师人格与统一引用规范，委派会稀释上下文且扩大工具面 |
+| ch06 异步子 Agent | `AsyncSubAgent` 派活即返回任务 ID，五个遥控器工具（start/check/update/cancel/list） | 未采用。注意区分三种"异步"：本项目 Web 的异步是**编程层 `async/await` + 异步 checkpointer + SSE**，不是后台子任务编排；未来批量入库/长综述可考虑 |
+| ch07 Skills 能力包 | Progressive Disclosure 三级；`SKILL.md` frontmatter 规范；Filesystem/State/Store 三种 Backend | 5 个教学技能随仓库分发，启动时增量同步进 jail；系统提示只挂 name+description，模型按需 `read_file` 读全文（详见第 4 节） |
+| ch08 长期记忆 | **短期记忆 = Checkpointer/thread，长期记忆 = Store/namespace**；`CompositeBackend` 按路径前缀路由（如 `/memories/` → StoreBackend） | M2 已落地 SQLite checkpointer（CLI/异步图共享同一文件）；**M4 将引入 SqliteStore + namespace（按学生隔离）承载跨会话学习画像**，让 learning-coach 的定级与间隔复习持久化 |
+| ch09 Human-in-the-Loop | `interrupt_on` 风险分级暂停，`Command(resume=...)` 凭同一 `thread_id` 恢复（必须配 Checkpointer，中断逻辑放 Node-style 钩子） | 暂未启用：工具面全部只读、无破坏性动作。未来"删除教材/重建索引"等敏感操作可加审批节点 |
+
+### 3. Agent 循环与流式：从 invoke 到 SSE
+
+CLI 走 `agent.invoke({"messages": [...]}, config={"configurable": {"thread_id": ...}})`，内部时间线：请求穿过 Middleware 洋葱圈（filesystem → subagents → summarization → todo → prompt_caching，最内层才是模型 HTTP 调用）→ AIMessage 带 `tool_calls` 则执行工具并回灌、继续循环，无 `tool_calls` 则到 END；递归上限防止死循环（超限 `GraphRecursionError`）。
+
+Web 不能用 `invoke`——前端要逐 token 显示并展示工具过程。因此：
+
+- 另装一张**异步图**（`build_async_agent()`）：模型、工具、提示词、jail、skills 与同步图完全一致，仅把 `SqliteSaver` 换成 `AsyncSqliteSaver`（`astream_events` 不支持同步 saver），两者经 WAL 模式共享同一个 `data/checkpoints.sqlite`；
+- `graph.astream_events(version="v2")` 把 `on_chat_model_stream` 映射为 SSE `token` 事件，`on_tool_start/end` 映射为 `tool_start/tool_end`，收尾发 `done`/`error`；
+- 前端用 fetch reader 手工解析 SSE（非 EventSource——需要 POST 发消息体）。
+
+### 4. Harness 安全裁剪：为什么关掉子代理、只留 read_file
+
+课程默认 harness 给 Agent 配齐 8 个文件工具与一个可无限委派的通用子代理；那是为"通用编程助手"设计的。教材答疑的攻击面和能力需求都不同，本项目通过 `register_harness_profile()` 为本模型注册定制 profile：
+
+```python
+profile = HarnessProfile(
+    general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+    excluded_tools=frozenset({"ls","write_file","edit_file","delete","glob","grep","execute"}),
+)
+register_harness_profile(f"openai:{config.LLM_MODEL}", profile)
+```
+
+- **保留 `read_file`**：SkillsMiddleware 的渐进披露要求模型自己读取 `/skills/<name>/SKILL.md`，这是唯一需要的文件能力；
+- **剔除其余 7 个**：写/改/删/执行对答疑无用，且 `LocalShellBackend` 式的 `execute` 无沙箱；
+- **关闭通用子代理**：`task` 委派会把问题丢给另一个人格的上下文，无法保证引用格式、拒答规则与教学节奏一致——隔离是 ch05 中子代理的优点，却是本场景的缺点；
+- **jail 双保险**：`FilesystemBackend(root_dir=data/agent_fs, virtual_mode=True)`，模型所见全为虚拟路径，`../../../etc/passwd` 类逃逸直接抛 `ValueError` 阻断（实测验证）。技能源在仓库 `skills/`，`_sync_skills_into_jail()` 仅在内容变化时增量复制。
+
+### 5. Skills：把教学法做成可复用能力包
+
+课程第 7 章的三级渐进披露在本项目被严格执行：
+
+| 级别 | 加载内容 | 时机 | 本项目 |
+|---|---|---|---|
+| L1 Metadata | `name` + `description` | 启动时全量 | 系统提示词只出现 5 条技能的路由规则，正文一个字不进常驻上下文 |
+| L2 Instructions | `SKILL.md` 全文 | 模型判定匹配后 | trace 中可见模型主动 `read_file('/skills/concept-explainer/SKILL.md', limit=1000)` |
+| L3 Resources | 引用文件 | 正文需要时 | 预留 `references/` 扩展位 |
+
+frontmatter 合规性按课程规范执行：`name` 小写连字符且**与父目录同名**（≤64 字符），`description` ≤1024 字符且写成"触发场景 + 做什么 + 产出什么"的召回句式——因为 description 是技能被选中的**唯一依据**，写模糊了就会漏召回/误召回。
+
+**Skills / Memory / Tools 的分工**（课程第 8 节的决策规则）在本项目的应用：
+
+- **Tools**：原子取证动作（检索、读片段）——每轮都需要 → `tools.py`
+- **Skills**：特定任务才需要的长篇教学剧本（5 种课型）——按需加载 → `skills/`
+- **Memory**：所有对话始终相关的全局规范（引用格式、拒答红线、人格）——启动即加载 → `prompts.py` 的系统提示词；M4 之后学生个人画像将成为第二层 Memory（Store 中按 namespace 持久的 `/memories/AGENTS.md` 模式）
+
+### 6. 记忆分层：thread 存档与跨会话画像
+
+课程里"游戏存档 vs 游戏背包"的比喻直接指导了本项目设计：
+
+- **存档（Checkpointer，已落地）**：每个超步后消息历史、工具轨迹序列化进 SQLite；同一 `thread_id` 跨进程完整续聊，多轮指代（"它的公式呢"）因此可解析；换 thread 即全新隔离。Web 的历史会话列表与回放接口（`sessions.py` + `GET /api/sessions/{id}/messages`）读的也是它。
+- **背包（Store，M4 路线）**：`SqliteStore` 按 `namespace`（如学生 ID）跨 thread 共享，配合 `CompositeBackend` 把 `/memories/` 前缀路由到 StoreBackend——Agent 仍用普通的 `read_file/edit_file` 读写，框架自动决定"下班清桌还是永久归档"。学习画像（ZPD 定级、错题档案、间隔复习到期点）将存于此。
+
 ## 目录结构
 
 ```
@@ -187,7 +268,7 @@ teach_agent/
 - [x] **M1** 离线 RAG：入库流水线 + 章节切块 + 本地 embedding + 阈值检索
 - [x] **M2** DeepAgents CLI：ReAct 工具调用、jail、教学 Skill、SQLite 持久会话
 - [x] **M3** Web：FastAPI SSE 流式问答、书架上传三态、React 前端、历史会话回放
-- [ ] **M4** SqliteStore 长时学习画像：跨会话的水平定级、错题档案与间隔复习调度（让 learning-coach 持久化）
+- [ ] **M4** 长期记忆（课程 ch08）：`SqliteStore` 按学生 namespace 持久化 + `CompositeBackend` 把 `/memories/` 路由到 StoreBackend，承载跨会话的水平定级、错题档案与间隔复习调度（让 learning-coach 从会话内升级为持久画像）
 - [ ] **M5** BM25 + 向量混合检索（改善符号/定理名等关键词场景）
 - [ ] **M6** OCR 入库（marker / 视觉模型，支持扫描版教材）
 
