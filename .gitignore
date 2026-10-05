@@ -1,0 +1,11 @@
+# 运行时数据（原书、解析产物、向量库、元数据库）
+/data/
+# Python
+.venv/
+__pycache__/
+*.pyc
+# 环境与密钥
+.env
+# IDE
+.idea/
+.vscode/
